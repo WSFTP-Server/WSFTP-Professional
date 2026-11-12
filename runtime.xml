@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<project name="Java Runtime" basedir=".">
+
+    <property name="runtime.dependency" value="${build}/jdk-25.0.5+8-universal"/>
+
+    <property name="bundle.runtime" value="${bundle.plugins}/Runtime.jre"/>
+    <property name="bundle.runtime.lib"
+              value="@executable_path/../PlugIns/Runtime.jre/Contents/Home/lib/server/libjvm.dylib"/>
+
+    <property name="build.lipo.binaries" value="**/Contents/Frameworks/*.dylib"/>
+
+    <target name="runtime">
+        <mkdir dir="${bundle}/${bundle.runtime}"/>
+        <!-- Copy runtime -->
+        <echo message="Copy runtime from ${runtime.dependency} to ${bundle}/${bundle.runtime}"/>
+        <copy todir="${bundle}/${bundle.runtime}" preservelastmodified="true">
+            <fileset followsymlinks="true" dir="${runtime.dependency}" excludesfile="${home}/runtime-excludes.properties"/>
+        </copy>
+        <chmod perm="a+x" type="file">
+            <fileset dir="${bundle}/${bundle.runtime}">
+                <include name="Contents/Home/lib/jspawnhelper"/>
+            </fileset>
+        </chmod>
+    </target>
+
+    <target name="shared-library-install-name">
+        <echo message="Change dynamic shared library install names to ${newname} in ${directory}"/>
+        <apply executable="/usr/bin/xcrun" failonerror="true"
+               type="file"
+               parallel="false" spawn="false" force="true">
+            <arg line="install_name_tool -change ${oldname} ${newname}"/>
+            <fileset dir="${directory}">
+                <include name="*.dylib"/>
+            </fileset>
+            <srcfile/>
+        </apply>
+    </target>
+
+    <target name="lipo">
+        <echo message="Remove ${arch} slice from ${build.lipo.binaries}"/>
+        <apply executable="/usr/bin/xcrun" failonerror="false" dest="${bundle}"
+               parallel="false" spawn="false" force="true">
+            <!--Remove from executables-->
+            <!--Remove from frameworks-->
+            <!--Remove from shared libraries-->
+            <fileset dir="${bundle}" includes="${build.lipo.binaries}"/>
+            <arg line="lipo -remove ${arch} -output"/>
+            <srcfile/>
+            <targetfile/>
+            <identitymapper/>
+        </apply>
+    </target>
+</project>

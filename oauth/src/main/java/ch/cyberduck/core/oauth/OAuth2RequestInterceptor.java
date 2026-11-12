@@ -1,0 +1,136 @@
+package ch.cyberduck.core.oauth;
+
+/*
+ * Copyright (c) 2002-2016 iterate GmbH. All rights reserved.
+ * https://cyberduck.io/
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+import ch.cyberduck.core.Host;
+import ch.cyberduck.core.HostUrlProvider;
+import ch.cyberduck.core.LocaleFactory;
+import ch.cyberduck.core.LoginCallback;
+import ch.cyberduck.core.OAuthTokens;
+import ch.cyberduck.core.Profile;
+import ch.cyberduck.core.Scheme;
+import ch.cyberduck.core.exception.BackgroundException;
+import ch.cyberduck.core.exception.LoginCanceledException;
+
+import ch.cyberduck.core.threading.CancelCallback;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.HttpException;
+import org.apache.http.HttpHeaders;
+import org.apache.http.HttpRequest;
+import org.apache.http.HttpRequestInterceptor;
+import org.apache.http.client.HttpClient;
+import org.apache.http.message.BasicHeader;
+import org.apache.http.protocol.HttpContext;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
+
+import com.google.api.client.auth.oauth2.Credential;
+
+public class OAuth2RequestInterceptor extends OAuth2AuthorizationService implements HttpRequestInterceptor {
+    private static final Logger log = LogManager.getLogger(OAuth2RequestInterceptor.class);
+
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Host host;
+    private final CancelCallback cancel;
+
+    public OAuth2RequestInterceptor(final HttpClient client, final Host host, final LoginCallback prompt, final CancelCallback cancel) throws LoginCanceledException {
+        this(client, host,
+                Scheme.isURL(host.getProtocol().getOAuthTokenUrl()) ? host.getProtocol().getOAuthTokenUrl() : new HostUrlProvider().withUsername(false).withPath(true).get(
+                        host.getProtocol().getScheme(), host.getPort(), null, host.getHostname(), host.getProtocol().getOAuthTokenUrl()),
+                Scheme.isURL(host.getProtocol().getOAuthAuthorizationUrl()) ? host.getProtocol().getOAuthAuthorizationUrl() : new HostUrlProvider().withUsername(false).withPath(true).get(
+                        host.getProtocol().getScheme(), host.getPort(), null, host.getHostname(), host.getProtocol().getOAuthAuthorizationUrl()),
+                prompt(host, prompt, Profile.OAUTH_CLIENT_ID_KEY, LocaleFactory.localizedString(
+                                Profile.OAUTH_CLIENT_ID_KEY, "Credentials"),
+                        null == host.getProperty(Profile.OAUTH_CLIENT_ID_KEY) ? host.getProtocol().getOAuthClientId() : host.getProperty(Profile.OAUTH_CLIENT_ID_KEY)),
+                prompt(host, prompt, Profile.OAUTH_CLIENT_SECRET_KEY, LocaleFactory.localizedString(
+                                Profile.OAUTH_CLIENT_SECRET_KEY, "Credentials"),
+                        null == host.getProperty(Profile.OAUTH_CLIENT_SECRET_KEY) ? host.getProtocol().getOAuthClientSecret() : host.getProperty(Profile.OAUTH_CLIENT_SECRET_KEY)),
+                host.getProtocol().getOAuthScopes(),
+                host.getProtocol().isOAuthPKCE(), prompt, cancel);
+    }
+
+    @Deprecated
+    public OAuth2RequestInterceptor(final HttpClient client, final Host host, final String tokenServerUrl, final String authorizationServerUrl,
+                                    final String clientid, final String clientsecret, final List<String> scopes, final boolean pkce, final LoginCallback prompt) throws LoginCanceledException {
+        this(client, host, tokenServerUrl, authorizationServerUrl, clientid, clientsecret, scopes, pkce, prompt, CancelCallback.noop);
+    }
+
+    public OAuth2RequestInterceptor(final HttpClient client, final Host host, final String tokenServerUrl, final String authorizationServerUrl,
+                                    final String clientid, final String clientsecret, final List<String> scopes, final boolean pkce, final LoginCallback prompt, final CancelCallback cancel) throws LoginCanceledException {
+        super(client, host, tokenServerUrl, authorizationServerUrl, clientid, clientsecret, scopes, pkce, prompt);
+        this.host = host;
+        this.cancel = cancel;
+    }
+
+    @Override
+    public void process(final HttpRequest request, final HttpContext context) throws HttpException, IOException {
+        lock.lock();
+        try {
+            OAuthTokens tokens = host.getCredentials().getOauth();
+            if(tokens.isExpired()) {
+                try {
+                    tokens = this.save(this.authorizeWithRefreshToken(tokens, cancel));
+                }
+                catch(BackgroundException e) {
+                    log.warn("Failure {} refreshing OAuth tokens {}", e, tokens);
+                    // Follow-up error 401 handled in error interceptor
+                }
+            }
+            if(StringUtils.isNotBlank(tokens.getAccessToken())) {
+                this.addAuthorizationHeader(request, tokens);
+            }
+        }
+        finally {
+            lock.unlock();
+        }
+    }
+
+    protected void addAuthorizationHeader(final HttpRequest request, final OAuthTokens tokens) {
+        log.info("Authorizing service request with OAuth2 tokens {}", tokens);
+        request.removeHeaders(HttpHeaders.AUTHORIZATION);
+        request.addHeader(new BasicHeader(HttpHeaders.AUTHORIZATION, String.format("Bearer %s", tokens.getAccessToken())));
+    }
+
+
+    @Override
+    public OAuth2RequestInterceptor setMethod(final Credential.AccessMethod method) {
+        super.setMethod(method);
+        return this;
+    }
+
+    @Override
+    public OAuth2RequestInterceptor setRedirectUri(final String redirectUri) {
+        super.setRedirectUri(redirectUri);
+        return this;
+    }
+
+    @Override
+    public OAuth2RequestInterceptor setFlowType(final FlowType flowType) {
+        super.setFlowType(flowType);
+        return this;
+    }
+
+    @Override
+    public OAuth2RequestInterceptor setParameter(final String key, final String value) {
+        super.setParameter(key, value);
+        return this;
+    }
+}

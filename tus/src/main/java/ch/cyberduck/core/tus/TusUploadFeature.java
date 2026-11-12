@@ -1,0 +1,250 @@
+package ch.cyberduck.core.tus;
+
+/*
+ * Copyright (c) 2002-2024 iterate GmbH. All rights reserved.
+ * https://cyberduck.io/
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+import ch.cyberduck.core.ConnectionCallback;
+import ch.cyberduck.core.DefaultIOExceptionMappingService;
+import ch.cyberduck.core.DescriptiveUrl;
+import ch.cyberduck.core.Host;
+import ch.cyberduck.core.HostUrlProvider;
+import ch.cyberduck.core.Local;
+import ch.cyberduck.core.Path;
+import ch.cyberduck.core.ProgressListener;
+import ch.cyberduck.core.StringAppender;
+import ch.cyberduck.core.concurrency.Interruptibles;
+import ch.cyberduck.core.dav.DAVPathEncoder;
+import ch.cyberduck.core.dav.DAVSession;
+import ch.cyberduck.core.exception.AccessDeniedException;
+import ch.cyberduck.core.exception.BackgroundException;
+import ch.cyberduck.core.exception.InteroperabilityException;
+import ch.cyberduck.core.exception.NotfoundException;
+import ch.cyberduck.core.features.Upload;
+import ch.cyberduck.core.features.Write;
+import ch.cyberduck.core.http.DefaultHttpResponseExceptionMappingService;
+import ch.cyberduck.core.http.HttpUploadFeature;
+import ch.cyberduck.core.io.BandwidthThrottle;
+import ch.cyberduck.core.io.Checksum;
+import ch.cyberduck.core.io.ChecksumCompute;
+import ch.cyberduck.core.io.ChecksumComputeFactory;
+import ch.cyberduck.core.io.DisabledChecksumCompute;
+import ch.cyberduck.core.io.StreamListener;
+import ch.cyberduck.core.preferences.Preferences;
+import ch.cyberduck.core.preferences.PreferencesFactory;
+import ch.cyberduck.core.shared.DefaultUrlProvider;
+import ch.cyberduck.core.threading.BackgroundExceptionCallable;
+import ch.cyberduck.core.threading.DefaultRetryCallable;
+import ch.cyberduck.core.transfer.TransferStatus;
+
+import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.concurrent.ConcurrentUtils;
+import org.apache.http.HttpHeaders;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.HttpResponseException;
+import org.apache.http.client.ResponseHandler;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Future;
+
+import static ch.cyberduck.core.tus.TusCapabilities.*;
+
+public class TusUploadFeature extends HttpUploadFeature<Void> {
+    private static final Logger log = LogManager.getLogger(TusUploadFeature.class);
+
+    public static final String UPLOAD_URL = "uploadUrl";
+
+    private final Preferences preferences = PreferencesFactory.get();
+
+    private final DAVSession session;
+    private final TusCapabilities capabilities;
+
+    public TusUploadFeature(final DAVSession session, final TusCapabilities capabilities) {
+        this.session = session;
+        this.capabilities = capabilities;
+    }
+
+    @Override
+    public ChecksumCompute checksum(final Path file, final TransferStatus status) {
+        if(capabilities.extensions.contains(Extension.checksum)) {
+            return ChecksumComputeFactory.get(capabilities.hashAlgorithm);
+        }
+        log.debug("No checksum support in capabilities {}", capabilities);
+        return new DisabledChecksumCompute();
+    }
+
+    @Override
+    public EnumSet<Flags> features(final Path file, final TransferStatus status) {
+        if(capabilities.extensions.contains(Extension.checksum)) {
+            return EnumSet.of(Flags.checksumOptional);
+        }
+        return EnumSet.noneOf(Flags.class);
+    }
+
+    @Override
+    public Void upload(final Write<Void> write, final Path file, final Local local, final BandwidthThrottle throttle, final ProgressListener progress, final StreamListener listener,
+                       final TransferStatus status, final ConnectionCallback callback) throws BackgroundException {
+        // In order to achieve parallel upload the Concatenation extension MAY be used.
+        final List<Future<Void>> chunks = new ArrayList<>();
+        final String uploadUrl;
+        if(status.isAppend()) {
+            if(StringUtils.isBlank(preferences.getProperty(toUploadUrlPropertyKey(session.getHost(), file, status)))) {
+                log.debug("No previous upload URL for {}", file);
+                uploadUrl = this.start(file, status.setAppend(false));
+            }
+            else {
+                uploadUrl = preferences.getProperty(toUploadUrlPropertyKey(session.getHost(), file, status));
+                log.debug("Resume upload to {} for {} from offset {}", uploadUrl, file, status.getOffset());
+            }
+        }
+        else {
+            log.warn("No resume upload attempt for {}", file);
+            uploadUrl = this.start(file, status);
+            preferences.setProperty(toUploadUrlPropertyKey(session.getHost(), file, status), uploadUrl);
+        }
+        long offset = status.getOffset();
+        long remaining = status.getLength();
+        while(remaining > 0) {
+            final long length = Math.min(preferences.getInteger("tus.chunk.size"), remaining);
+            chunks.add(this.submit(write, file, local, throttle, listener, status,
+                    uploadUrl, offset, length, callback));
+            remaining -= length;
+            offset += length;
+        }
+        // Await upload of chunks
+        Interruptibles.awaitAll(chunks);
+        // Mark parent status as complete
+        log.debug("Completed all chunks to {} for {}", uploadUrl, file);
+        preferences.deleteProperty(toUploadUrlPropertyKey(session.getHost(), file, status.setComplete()));
+        return null;
+    }
+
+    private String start(final Path file, final TransferStatus status) throws BackgroundException {
+        final String uploadUrl;
+        if(!capabilities.extensions.contains(Extension.creation)) {
+            throw new InteroperabilityException(String.format("No support for %s", Extension.creation));
+        }
+        // Create an Upload URL
+        final HttpPost request = new HttpPost(String.format("%s%s", new HostUrlProvider().withUsername(false).get(session.getHost()),
+                new DAVPathEncoder(session).encode(file.getParent())));
+        request.setHeader(TUS_HEADER_RESUMABLE, TUS_VERSION);
+        // The Upload-Length header indicates the size of the entire upload in bytes
+        request.setHeader(TUS_HEADER_UPLOAD_LENGTH, String.valueOf(status.getParent().getLength()));
+        // The Upload-Metadata request and response header MUST consist of one or more comma-separated key-value pairs
+        final StringAppender metadata = new StringAppender(',');
+        metadata.append(String.format("filename %s", Base64.encodeBase64String(file.getName().getBytes(StandardCharsets.UTF_8))));
+        if(status.getModified() != null) {
+            // Modification time (Unix time format)
+            metadata.append(String.format("mtime %s", status.getModified() / 1000));
+        }
+        if(status.getMime() != null) {
+            metadata.append(String.format("filetype %s", status.getMime()));
+        }
+        if(status.getChecksum() != Checksum.NONE) {
+            metadata.append(String.format("checksum %s", String.format("%s %s", status.getChecksum().algorithm, status.getChecksum().hex)));
+        }
+        request.setHeader(TUS_HEADER_UPLOAD_METADATA, metadata.toString());
+        try {
+            uploadUrl = session.getClient().execute(request, new ResponseHandler<String>() {
+                @Override
+                public String handleResponse(final HttpResponse response) throws HttpResponseException {
+                    if(response.containsHeader(HttpHeaders.LOCATION)) {
+                        return response.getFirstHeader(HttpHeaders.LOCATION).getValue();
+                    }
+                    throw new HttpResponseException(response.getStatusLine().getStatusCode(), response.getStatusLine().getReasonPhrase());
+                }
+            });
+        }
+        catch(HttpResponseException e) {
+            throw new DefaultHttpResponseExceptionMappingService().map("Upload {0} failed", e, file);
+        }
+        catch(IOException e) {
+            throw new DefaultIOExceptionMappingService().map("Upload {0} failed", e, file);
+        }
+        log.debug("Save upload URL {} for {}", uploadUrl, file);
+        return uploadUrl;
+    }
+
+    private Future<Void> submit(final Write<Void> write, final Path file, final Local local,
+                                final BandwidthThrottle throttle, final StreamListener listener,
+                                final TransferStatus overall, final String uploadUrl,
+                                final long offset, final long length, final ConnectionCallback callback) throws BackgroundException {
+        overall.validate();
+        log.info("Send part of {} with offset {} and length {} from {}", file, offset, length, overall.getLength());
+        return ConcurrentUtils.constantFuture(new DefaultRetryCallable<>(session.getHost(), new BackgroundExceptionCallable<Void>() {
+            @Override
+            public Void call() throws BackgroundException {
+                overall.validate();
+                final TransferStatus status = new TransferStatus()
+                        .setSegment(true)
+                        .setParent(overall)
+                        .setOffset(offset)
+                        .setLength(length);
+                status.setHeader(overall.getHeader());
+                // Optional checksum of the chunk for the server to verify
+                if(TusUploadFeature.this.features(file, overall).contains(Upload.Flags.checksumOptional)) {
+                    status.setChecksum(status.compute(local, TusUploadFeature.this.checksum(file, status).getAlgorithm()));
+                }
+                final Map<String, String> parameters = new HashMap<>();
+                parameters.put(UPLOAD_URL, uploadUrl);
+                status.setParameters(parameters);
+                final Void response = TusUploadFeature.this.upload(
+                        write, file, local, throttle, ProgressListener.noop, listener, status, overall, status, callback);
+                log.info("Received response {}", response);
+                return null;
+            }
+        }, overall).call());
+    }
+
+    @Override
+    public Write.Append append(final Path file, final TransferStatus status) throws BackgroundException {
+        // Determine the offset at which the upload should be continued
+        final String property = toUploadUrlPropertyKey(session.getHost(), file, status);
+        final String uploadUrl = preferences.getProperty(property);
+        if(StringUtils.isBlank(uploadUrl)) {
+            log.debug("No previous upload URL for {}", file);
+            return Write.override;
+        }
+        try {
+            return new Write.Append(true).withStatus(status).withOffset(new TusUploadHelper(session).offset(uploadUrl));
+        }
+        catch(NotfoundException | AccessDeniedException | InteroperabilityException e) {
+            log.warn("Delete upload URL {}", uploadUrl);
+            preferences.deleteProperty(property);
+            return Write.override;
+        }
+    }
+
+    /**
+     * Key to use in preferences to save upload URL for file
+     */
+    private static String toUploadUrlPropertyKey(final Host host, final Path file, final TransferStatus status) {
+        final String key = String.format("tus.url.%s%s",
+                Base64.encodeBase64String(new DefaultUrlProvider(host).toUrl(file,
+                        EnumSet.of(DescriptiveUrl.Type.provider)).find(DescriptiveUrl.Type.provider).getUrl().getBytes(StandardCharsets.UTF_8)),
+                null == status.getChecksum() ? StringUtils.EMPTY : String.format(":%s", status.getChecksum().base64));
+        log.debug("Return upload URL property key {} for file {}", key, file);
+        return key;
+    }
+}
