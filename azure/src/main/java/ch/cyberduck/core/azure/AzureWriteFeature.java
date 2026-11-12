@@ -1,0 +1,192 @@
+package ch.cyberduck.core.azure;
+
+/*
+ * Copyright (c) 2002-2024 iterate GmbH. All rights reserved.
+ * https://cyberduck.io/
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+import ch.cyberduck.core.ConnectionCallback;
+import ch.cyberduck.core.DirectoryDelimiterPathContainerService;
+import ch.cyberduck.core.Path;
+import ch.cyberduck.core.PathAttributes;
+import ch.cyberduck.core.PathContainerService;
+import ch.cyberduck.core.exception.BackgroundException;
+import ch.cyberduck.core.features.Write;
+import ch.cyberduck.core.io.Checksum;
+import ch.cyberduck.core.io.ChecksumCompute;
+import ch.cyberduck.core.io.ChecksumComputeFactory;
+import ch.cyberduck.core.io.HashAlgorithm;
+import ch.cyberduck.core.io.StatusOutputStream;
+import ch.cyberduck.core.io.VoidStatusOutputStream;
+import ch.cyberduck.core.preferences.HostPreferencesFactory;
+import ch.cyberduck.core.preferences.Preferences;
+import ch.cyberduck.core.preferences.PreferencesFactory;
+import ch.cyberduck.core.transfer.TransferStatus;
+
+import org.apache.commons.codec.DecoderException;
+import org.apache.commons.codec.binary.Hex;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.HttpHeaders;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.util.HashMap;
+import java.util.Map;
+
+import com.azure.core.http.rest.Response;
+import com.azure.storage.blob.BlobClient;
+import com.azure.storage.blob.models.AppendBlobItem;
+import com.azure.storage.blob.models.BlobHttpHeaders;
+import com.azure.storage.blob.models.BlobType;
+import com.azure.storage.blob.models.ParallelTransferOptions;
+import com.azure.storage.blob.options.AppendBlobCreateOptions;
+import com.azure.storage.blob.options.BlockBlobOutputStreamOptions;
+import com.azure.storage.blob.specialized.AppendBlobClient;
+import com.azure.storage.common.implementation.Constants;
+
+public class AzureWriteFeature implements Write<Void> {
+    private static final Logger log = LogManager.getLogger(AzureWriteFeature.class);
+
+    private final AzureSession session;
+
+    private final PathContainerService containerService
+            = new DirectoryDelimiterPathContainerService();
+
+    private final Preferences preferences
+            = PreferencesFactory.get();
+    private final BlobType blobType;
+
+    public AzureWriteFeature(final AzureSession session) {
+        this(session, BlobType.valueOf(HostPreferencesFactory.get(session.getHost()).getProperty("azure.upload.blobtype")));
+    }
+
+    public AzureWriteFeature(final AzureSession session, final BlobType blobType) {
+        this.session = session;
+        this.blobType = blobType;
+    }
+
+    @Override
+    public StatusOutputStream<Void> write(final Path file, final TransferStatus status, final ConnectionCallback callback) throws BackgroundException {
+        try {
+            final BlobClient client = session.getClient().getBlobServiceClient().getBlobContainerClient(containerService.getContainer(file).getName())
+                    .getBlobClient(containerService.getKey(file));
+            final BlobHttpHeaders headers = new BlobHttpHeaders();
+            if(StringUtils.isNotBlank(status.getMime())) {
+                headers.setContentType(status.getMime());
+            }
+            final Map<String, String> metadata = new HashMap<>(status.getMetadata());
+            for(final Map.Entry<String, String> m : metadata.entrySet()) {
+                if(HttpHeaders.CACHE_CONTROL.equalsIgnoreCase(m.getKey())) {
+                    // Update properties
+                    headers.setCacheControl(m.getValue());
+                }
+                if(HttpHeaders.CONTENT_TYPE.equalsIgnoreCase(m.getKey())) {
+                    // Update properties
+                    headers.setContentType(m.getValue());
+                }
+            }
+            metadata.remove(HttpHeaders.CACHE_CONTROL);
+            metadata.remove(HttpHeaders.CONTENT_TYPE);
+            final Checksum checksum = status.getChecksum();
+            switch(checksum.algorithm) {
+                case md5:
+                    try {
+                        headers.setContentMd5(Hex.decodeHex(checksum.hash.toCharArray()));
+                    }
+                    catch(DecoderException e) {
+                        // Ignore
+                    }
+                    break;
+            }
+            final OutputStream out;
+            if(status.isExists()) {
+                if(preferences.getBoolean("azure.upload.snapshot")) {
+                    session.getClient().getBlobServiceClient().getBlobContainerClient(containerService.getContainer(file).getName())
+                            .getBlobClient(containerService.getKey(file)).createSnapshot();
+                }
+                if(status.isAppend()) {
+                    // Existing append blob type
+                    final AppendBlobClient append = client.getAppendBlobClient();
+                    out = this.buffer(append.getBlobOutputStream());
+                }
+                else {
+                    // Overwrite existing blob retaining its type. Type of existing blob cannot be changed in place.
+                    final PathAttributes attr = new AzureAttributesFinderFeature(session).find(file);
+                    out = this.create(client, BlobType.valueOf(attr.getCustom().get(AzureAttributesFinderFeature.KEY_BLOB_TYPE)), metadata, headers, file);
+                }
+            }
+            else {
+                // Create new blob with default type set in defaults
+                out = this.create(client, blobType, metadata, headers, file);
+            }
+            return new VoidStatusOutputStream(out) {
+                @Override
+                public void close() throws IOException {
+                    try {
+                        super.close();
+                    }
+                    catch(RuntimeException e) {
+                        this.handleIOException(new IOException(e.getMessage(), e));
+                    }
+                }
+
+                @Override
+                protected void handleIOException(final IOException e) throws IOException {
+                    if(StringUtils.equals(Constants.STREAM_CLOSED, e.getMessage())) {
+                        log.warn(String.format("Ignore failure %s", e));
+                        return;
+                    }
+                    throw e;
+                }
+            };
+        }
+        catch(RuntimeException e) {
+            throw new AzureExceptionMappingService().map("Upload {0} failed", e, file);
+        }
+    }
+
+    /**
+     * The stream of the SDK commits every write as a separate append block which are limited to 50,000 per blob.
+     * Buffer writes to commit blocks of the configured block size.
+     */
+    private OutputStream buffer(final OutputStream proxy) {
+        return new BufferedOutputStream(proxy, preferences.getInteger("azure.upload.blocksize"));
+    }
+
+    private OutputStream create(final BlobClient client, final BlobType type, final Map<String, String> metadata,
+                                final BlobHttpHeaders headers, final Path file) {
+        switch(type) {
+            case APPEND_BLOB: {
+                final AppendBlobClient append = client.getAppendBlobClient();
+                final AppendBlobCreateOptions options = new AppendBlobCreateOptions()
+                        .setMetadata(metadata)
+                        .setHeaders(headers);
+                // Creates a 0-length append blob replacing an existing blob
+                final Response<AppendBlobItem> response = append.createWithResponse(options, null, null);
+                log.debug("Created append blob {} with status {}", file, response.getStatusCode());
+                return this.buffer(append.getBlobOutputStream());
+            }
+            default: {
+                final BlockBlobOutputStreamOptions options = new BlockBlobOutputStreamOptions()
+                        .setMetadata(metadata)
+                        .setHeaders(headers)
+                        .setParallelTransferOptions(new ParallelTransferOptions()
+                                .setBlockSizeLong(preferences.getLong("azure.upload.blocksize")));
+                return client.getBlockBlobClient().getBlobOutputStream(options);
+            }
+        }
+    }
+}

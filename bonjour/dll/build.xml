@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+ *	$Revision: 6757 $
+ *	$Date: 2010-08-25 13:25:44 +0200 (Mi, 25 Aug 2010) $
+ *
+ *  Copyright (c) 2005-2012 David Kocher. All rights reserved.
+ *  http://cyberduck.io/
+ *
+ *	This program is free software; you can redistribute it and/or modify
+ *	it under the terms of the GNU General Public License as published by
+ *	the Free Software Foundation; either version 2 of the License, or
+ *	(at your option) any later version.package
+ *
+ *	This program is distributed in the hope that it will be useful,
+ *	but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *	GNU General Public License for more details.
+ *
+ *	Bug fixes, suggestions and comments should be sent to:
+ *	dkocher@cyberduck.io
+ -->
+<project name="Cyberduck Native Libraries" basedir=".">
+
+    <import file="../../build.xml" />
+
+    <target name="restore" depends="msbuild">
+        <msbuild buildfile="Cyberduck.Bonjour.ikvmproj">
+            <target name="Restore" />
+        </msbuild>
+    </target>
+
+    <target name="build" depends="restore,msbuild">
+        <msbuild buildfile="Cyberduck.Bonjour.ikvmproj">
+            <property name="Configuration" value="${msbuild.configuration}" />
+        </msbuild>
+    </target>
+
+    <target name="pack" depends="msbuild">
+        <msbuild buildfile="Cyberduck.Bonjour.ikvmproj">
+            <target name="Pack" />
+
+            <property name="Configuration" value="${msbuild.configuration}" />
+        </msbuild>
+    </target>
+
+</project>

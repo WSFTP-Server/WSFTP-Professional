@@ -1,0 +1,102 @@
+package ch.cyberduck.core.azure;
+
+/*
+ * Copyright (c) 2002-2022 iterate GmbH. All rights reserved.
+ * https://cyberduck.io/
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+import ch.cyberduck.core.AlphanumericRandomStringService;
+import ch.cyberduck.core.AsciiRandomStringService;
+import ch.cyberduck.core.CachingFindFeature;
+import ch.cyberduck.core.DisabledListProgressListener;
+import ch.cyberduck.core.LoginCallback;
+import ch.cyberduck.core.Path;
+import ch.cyberduck.core.PathCache;
+import ch.cyberduck.core.features.Delete;
+import ch.cyberduck.core.shared.DefaultHomeFinderService;
+import ch.cyberduck.core.transfer.TransferStatus;
+import ch.cyberduck.test.IntegrationTest;
+
+import org.junit.Test;
+import org.junit.experimental.categories.Category;
+
+import java.util.Collections;
+import java.util.EnumSet;
+
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+@Category(IntegrationTest.class)
+public class AzureFindFeatureTest extends AbstractAzureTest {
+
+    @Test
+    public void testFindNotFound() throws Exception {
+        final Path container = new Path("cyberduck", EnumSet.of(Path.Type.directory, Path.Type.volume));
+        assertFalse(new AzureFindFeature(session).find(new Path(container, new AlphanumericRandomStringService().random(), EnumSet.of(Path.Type.file))));
+    }
+
+    @Test
+    public void testFindHome() throws Exception {
+        assertTrue(new AzureFindFeature(session).find(new DefaultHomeFinderService(session).find()));
+    }
+
+    @Test
+    public void testFindDirectory() throws Exception {
+        final Path container = new Path("cyberduck", EnumSet.of(Path.Type.directory, Path.Type.volume));
+        final Path folder = new AzureDirectoryFeature(session).mkdir(
+                new AzureWriteFeature(session), new Path(container, new AlphanumericRandomStringService().random(), EnumSet.of(Path.Type.directory)), new TransferStatus());
+        assertTrue(new AzureFindFeature(session).find(folder));
+        assertFalse(new AzureFindFeature(session).find(new Path(folder.getAbsolute(), EnumSet.of(Path.Type.file))));
+        new AzureDeleteFeature(session).delete(Collections.singletonList(folder), LoginCallback.noop, new Delete.DisabledCallback());
+    }
+
+    @Test
+    public void testFindFile() throws Exception {
+        final Path container = new Path("cyberduck", EnumSet.of(Path.Type.directory, Path.Type.volume));
+        final Path file = new Path(container, new AlphanumericRandomStringService().random(), EnumSet.of(Path.Type.file));
+        new AzureTouchFeature(session).touch(new AzureWriteFeature(session), file, new TransferStatus());
+        assertTrue(new AzureFindFeature(session).find(file));
+        assertFalse(new AzureFindFeature(session).find(new Path(file.getAbsolute(), EnumSet.of(Path.Type.directory))));
+        new AzureDeleteFeature(session).delete(Collections.singletonList(file), LoginCallback.noop, new Delete.DisabledCallback());
+    }
+
+    @Test
+    public void testFindCommonPrefix() throws Exception {
+        final Path container = new Path("cyberduck", EnumSet.of(Path.Type.directory, Path.Type.volume));
+        assertTrue(new AzureFindFeature(session).find(container));
+        final String prefix = new AlphanumericRandomStringService().random();
+        final Path intermediate = new Path(container, prefix, EnumSet.of(Path.Type.directory));
+        final Path test = new AzureTouchFeature(session).touch(new AzureWriteFeature(session), new Path(intermediate, new AsciiRandomStringService().random(), EnumSet.of(Path.Type.file)), new TransferStatus());
+        assertTrue(new AzureFindFeature(session).find(test));
+        assertFalse(new AzureFindFeature(session).find(new Path(test.getAbsolute(), EnumSet.of(Path.Type.directory))));
+        assertTrue(new AzureFindFeature(session).find(intermediate));
+        // Ignore 404 for placeholder and search for common prefix
+        assertTrue(new AzureFindFeature(session).find(new Path(container, prefix, EnumSet.of(Path.Type.directory, Path.Type.placeholder))));
+        assertTrue(new AzureListService(session).list(intermediate,
+                new DisabledListProgressListener()).contains(test));
+        new AzureDeleteFeature(session).delete(Collections.singletonList(test), LoginCallback.noop, new Delete.DisabledCallback());
+        assertFalse(new AzureFindFeature(session).find(test));
+        final Delete delete = new AzureDeleteFeature(session);
+        if(delete.features(intermediate).contains(Delete.Flags.recursive)) {
+            // Parent directory is not implicit in hierarchical namespace
+            assertTrue(new AzureFindFeature(session).find(intermediate));
+            delete.delete(Collections.singletonList(intermediate), LoginCallback.noop, new Delete.DisabledCallback());
+        }
+        assertFalse(new AzureFindFeature(session).find(intermediate));
+        final PathCache cache = new PathCache(1);
+        final Path directory = new Path(container, prefix, EnumSet.of(Path.Type.directory, Path.Type.placeholder));
+        assertFalse(new CachingFindFeature(session, cache, new AzureFindFeature(session)).find(directory));
+        assertFalse(cache.isCached(directory));
+        assertFalse(new AzureFindFeature(session).find(new Path(container, prefix, EnumSet.of(Path.Type.directory, Path.Type.placeholder))));
+    }
+}

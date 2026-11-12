@@ -1,0 +1,229 @@
+package ch.cyberduck.core.azure;
+
+/*
+ * Copyright (c) 2002-2024 iterate GmbH. All rights reserved.
+ * https://cyberduck.io/
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+import ch.cyberduck.core.Credentials;
+import ch.cyberduck.core.DefaultIOExceptionMappingService;
+import ch.cyberduck.core.Host;
+import ch.cyberduck.core.HostKeyCallback;
+import ch.cyberduck.core.HostUrlProvider;
+import ch.cyberduck.core.ListService;
+import ch.cyberduck.core.LoginCallback;
+import ch.cyberduck.core.PreferencesUseragentProvider;
+import ch.cyberduck.core.UrlProvider;
+import ch.cyberduck.core.azure.apache.ApacheHttpClient;
+import ch.cyberduck.core.exception.BackgroundException;
+import ch.cyberduck.core.exception.LoginCanceledException;
+import ch.cyberduck.core.features.AclPermission;
+import ch.cyberduck.core.features.AttributesFinder;
+import ch.cyberduck.core.features.Copy;
+import ch.cyberduck.core.features.Delete;
+import ch.cyberduck.core.features.Directory;
+import ch.cyberduck.core.features.Find;
+import ch.cyberduck.core.features.Headers;
+import ch.cyberduck.core.features.Logging;
+import ch.cyberduck.core.features.Metadata;
+import ch.cyberduck.core.features.Move;
+import ch.cyberduck.core.features.Read;
+import ch.cyberduck.core.features.Touch;
+import ch.cyberduck.core.features.Upload;
+import ch.cyberduck.core.features.Write;
+import ch.cyberduck.core.http.HttpSession;
+import ch.cyberduck.core.oauth.OAuth2RequestInterceptor;
+import ch.cyberduck.core.proxy.ProxyFinder;
+import ch.cyberduck.core.ssl.DefaultX509KeyManager;
+import ch.cyberduck.core.ssl.DisabledX509TrustManager;
+import ch.cyberduck.core.ssl.X509KeyManager;
+import ch.cyberduck.core.ssl.X509TrustManager;
+import ch.cyberduck.core.threading.CancelCallback;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.HttpHeaders;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.concurrent.atomic.AtomicReference;
+
+import com.azure.core.http.HttpPipelineCallContext;
+import com.azure.core.http.HttpPipelineNextPolicy;
+import com.azure.core.http.HttpPipelineNextSyncPolicy;
+import com.azure.core.http.HttpResponse;
+import com.azure.core.http.policy.AddHeadersPolicy;
+import com.azure.core.http.policy.BearerTokenAuthenticationPolicy;
+import com.azure.core.http.policy.HttpPipelinePolicy;
+import com.azure.storage.blob.BlobServiceClientBuilder;
+import com.azure.storage.blob.models.AccountKind;
+import com.azure.storage.blob.models.StorageAccountInfo;
+import com.azure.storage.file.datalake.DataLakeServiceClientBuilder;
+import reactor.core.publisher.Mono;
+
+public class AzureSession extends HttpSession<AzureClient> {
+    private static final Logger log = LogManager.getLogger(AzureSession.class);
+
+    private final AtomicReference<StorageAccountInfo> storageAccountInfo
+            = new AtomicReference<>();
+
+    /**
+     * Set when authenticating with Microsoft Entra ID
+     */
+    private OAuth2RequestInterceptor authorizationService;
+
+    public AzureSession(final Host h) {
+        super(h, new DisabledX509TrustManager(), new DefaultX509KeyManager());
+    }
+
+    public AzureSession(final Host h, final X509TrustManager trust, final X509KeyManager key) {
+        super(h, trust, key);
+    }
+
+    @Override
+    protected AzureClient connect(final ProxyFinder proxy, final HostKeyCallback key, final LoginCallback prompt, final CancelCallback cancel) throws LoginCanceledException {
+        final HttpClientBuilder pool = builder.build(proxy, this, prompt);
+        if(host.getProtocol().isOAuthConfigurable()) {
+            authorizationService = new OAuth2RequestInterceptor(pool.build(), host, prompt, cancel)
+                    .setRedirectUri(host.getProtocol().getOAuthRedirectUrl());
+        }
+        final String endpoint = new HostUrlProvider().withUsername(false).get(host);
+        final ApacheHttpClient http = new ApacheHttpClient(pool);
+        final HttpPipelinePolicy user = new AddHeadersPolicy(new com.azure.core.http.HttpHeaders(
+                Collections.singletonMap(HttpHeaders.USER_AGENT, new PreferencesUseragentProvider().get())));
+        final HttpPipelinePolicy empty = new EmptyAuthenticationPolicy();
+        return new AzureClient(
+                new BlobServiceClientBuilder().endpoint(endpoint).httpClient(http).addPolicy(empty).addPolicy(user),
+                new DataLakeServiceClientBuilder().endpoint(endpoint).httpClient(http).addPolicy(empty).addPolicy(user));
+    }
+
+    @Override
+    public void login(final LoginCallback prompt, final CancelCallback cancel) throws BackgroundException {
+        final Credentials credentials = host.getCredentials();
+        if(host.getProtocol().isOAuthConfigurable()) {
+            if(StringUtils.isBlank(credentials.getUsername())) {
+                // Set the storage account name to keep tokens separate for every account
+                credentials.setUsername(client.getBlobServiceClient().getAccountName());
+            }
+            credentials.setOauth(authorizationService.validate(credentials.getOauth(), cancel));
+            client.setCredentials(new AzureOAuthTokenCredential(authorizationService, credentials, cancel));
+        }
+        else {
+            client.setCredentials(credentials);
+        }
+        try {
+            final StorageAccountInfo accountInfo = client.getBlobServiceClient().getAccountInfo();
+            storageAccountInfo.set(accountInfo);
+            final AccountKind kind = accountInfo.getAccountKind();
+            if(log.isInfoEnabled()) {
+                log.info("Connected to account of kind {}", kind);
+            }
+        }
+        catch(RuntimeException e) {
+            throw new AzureExceptionMappingService().map(e);
+        }
+    }
+
+    public StorageAccountInfo getStorageAccountInfo() {
+        return storageAccountInfo.get();
+    }
+
+    @Override
+    public void disconnect() throws BackgroundException {
+        try {
+            if(client != null) {
+                try {
+                    ((ApacheHttpClient) client.getHttpPipeline().getHttpClient()).getHttpClient().close();
+                }
+                catch(IOException e) {
+                    throw new DefaultIOExceptionMappingService().map(e);
+                }
+            }
+        }
+        finally {
+            super.disconnect();
+        }
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> T _getFeature(final Class<T> type) {
+        if(type == ListService.class) {
+            return (T) new AzureListService(this);
+        }
+        if(type == Read.class) {
+            return (T) new AzureReadFeature(this);
+        }
+        if(type == Upload.class) {
+            return (T) new AzureUploadFeature(this);
+        }
+        if(type == Write.class) {
+            return (T) new AzureWriteFeature(this);
+        }
+        if(type == Directory.class) {
+            return (T) new AzureDirectoryFeature(this);
+        }
+        if(type == Delete.class) {
+            return (T) new AzureDeleteFeature(this);
+        }
+        if(type == Headers.class) {
+            return (T) new AzureMetadataFeature(this);
+        }
+        if(type == Metadata.class) {
+            return (T) new AzureMetadataFeature(this);
+        }
+        if(type == Find.class) {
+            return (T) new AzureFindFeature(this);
+        }
+        if(type == AttributesFinder.class) {
+            return (T) new AzureAttributesFinderFeature(this);
+        }
+        if(type == Logging.class) {
+            return (T) new AzureLoggingFeature(this);
+        }
+        if(type == Move.class) {
+            return (T) new AzureMoveFeature(this);
+        }
+        if(type == Copy.class) {
+            return (T) new AzureCopyFeature(this);
+        }
+        if(type == Touch.class) {
+            return (T) new AzureTouchFeature(this);
+        }
+        if(type == UrlProvider.class) {
+            return (T) new AzureUrlProvider(this);
+        }
+        if(type == AclPermission.class) {
+            return (T) new AzureAclPermissionFeature(this);
+        }
+        return super._getFeature(type);
+    }
+
+    private static final class EmptyAuthenticationPolicy extends BearerTokenAuthenticationPolicy {
+        public EmptyAuthenticationPolicy() {
+            super(request -> Mono.empty());
+        }
+
+        @Override
+        public HttpResponse processSync(final HttpPipelineCallContext context, final HttpPipelineNextSyncPolicy next) {
+            return next.processSync();
+        }
+
+        @Override
+        public Mono<HttpResponse> process(final HttpPipelineCallContext context, final HttpPipelineNextPolicy next) {
+            return next.process();
+        }
+    }
+}
