@@ -1,0 +1,66 @@
+package ch.cyberduck.core.ctera;
+
+/*
+ * Copyright (c) 2002-2022 iterate GmbH. All rights reserved.
+ * https://cyberduck.io/
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+import ch.cyberduck.core.Credentials;
+import ch.cyberduck.core.DisabledLoginCallback;
+import ch.cyberduck.core.Host;
+import ch.cyberduck.core.HostKeyCallback;
+import ch.cyberduck.core.LoginConnectionService;
+import ch.cyberduck.core.LoginOptions;
+import ch.cyberduck.core.ProgressListener;
+import ch.cyberduck.core.ssl.DefaultX509KeyManager;
+import ch.cyberduck.core.ssl.DisabledX509TrustManager;
+import ch.cyberduck.core.threading.CancelCallback;
+import ch.cyberduck.test.VaultTest;
+
+import org.junit.After;
+import org.junit.Before;
+
+import static org.junit.Assert.fail;
+
+public class AbstractCteraTest extends VaultTest {
+
+    protected CteraSession session;
+
+    @After
+    public void disconnect() throws Exception {
+        session.close();
+    }
+
+    @Before
+    public void setup() throws Exception {
+        final Host host = new Host(new CteraProtocol(), PROPERTIES.get("ctera.hostname"), new Credentials(PROPERTIES.get("ctera.user"))) {
+            @Override
+            public String getProperty(final String key) {
+                if("ctera.download.directio.enable".equals(key)) {
+                    return String.valueOf(true);
+                }
+                return super.getProperty(key);
+            }
+        };
+        host.setDefaultPath("/ServicesPortal/webdav/My Files");
+        session = new CteraSession(host, new DisabledX509TrustManager(), new DefaultX509KeyManager());
+        final LoginConnectionService login = new LoginConnectionService(new DisabledLoginCallback() {
+            @Override
+            public Credentials prompt(final Host bookmark, final String title, final String reason, final LoginOptions options) {
+                fail(reason);
+                return null;
+            }
+        }, HostKeyCallback.noop, new TestPasswordStore(), ProgressListener.noop);
+        login.check(session, CancelCallback.noop);
+    }
+}
